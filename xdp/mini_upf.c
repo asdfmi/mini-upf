@@ -5,7 +5,17 @@
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/udp.h>
+#include <linux/in.h>
+#include <stdbool.h>
 
+#ifndef IP_MF
+#define IP_MF 0x2000
+#endif
+#ifndef IP_OFFSET
+#define IP_OFFSET 0x1FFF
+#endif
+
+/* GTP-U decap + TEID-based forwarding for an uplink-only mini UPF. */
 #define GTPU_PORT 2152
 #define GTPU_FLAGS 0x30
 #define GTPU_MSGTYPE_TPDU 0xff
@@ -13,13 +23,15 @@
 #define TEID_FWD_ENTRIES 4096
 #define TEID_STATS_ENTRIES 4096
 
+/* TEID -> uplink forwarding metadata: egress ifindex and outer MACs. */
 struct teid_fwd {
 	__u32 out_ifindex;
 	__u8 dst_mac[ETH_ALEN];
 	__u8 src_mac[ETH_ALEN];
-	__u8 next_hop_ip[16]; /* 任意: IPv4/IPv6 用のプレースホルダ */
+	__u8 next_hop_ip[16]; /* Optional placeholder for IPv4/IPv6 next-hop */
 };
 
+/* Per-TEID accounting for packets/bytes/misses. */
 struct teid_stats {
 	__u64 pkts;
 	__u64 bytes;
@@ -33,6 +45,7 @@ struct {
 	__type(value, struct teid_fwd);
 } teid_fwd SEC("maps");
 
+/* Per-TEID counters: packets, bytes, and lookup miss stats. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, TEID_STATS_ENTRIES);
@@ -40,6 +53,7 @@ struct {
 	__type(value, struct teid_stats);
 } teid_stats SEC("maps");
 
+/* Allowed ingress interface (N3). If unset, any ingress is accepted. */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
@@ -54,6 +68,7 @@ struct gtpv1_hdr {
 	__be32 teid;
 };
 
+/* Initialize-on-first-use helper: bump hit counters for a TEID. */
 static __always_inline void update_stats_hit(__u32 teid, __u64 bytes)
 {
 	struct teid_stats *s = bpf_map_lookup_elem(&teid_stats, &teid);
@@ -68,6 +83,7 @@ static __always_inline void update_stats_hit(__u32 teid, __u64 bytes)
 	}
 }
 
+/* Initialize-on-first-use helper: bump lookup miss counter for a TEID. */
 static __always_inline void update_stats_miss(__u32 teid)
 {
 	struct teid_stats *s = bpf_map_lookup_elem(&teid_stats, &teid);
@@ -80,15 +96,19 @@ static __always_inline void update_stats_miss(__u32 teid)
 		__sync_fetch_and_add(&s->lookup_miss, 1);
 }
 
+/* Allow only the configured N3 ifindex; treat 0/unset as allow-all. */
 static __always_inline bool check_ingress_if(__u32 ingress_ifindex)
 {
 	__u32 key = 0;
 	__u32 *expected = bpf_map_lookup_elem(&ingress_if, &key);
 	if (!expected || *expected == 0)
-		return true; /* 未設定なら許可 */
+		return true; /* If not configured, allow */
 	return *expected == ingress_ifindex;
 }
 
+/* XDP entrypoint: validate ingress, parse outer IPv4/IPv6 UDP GTP-U, lookup TEID,
+ * decapsulate to the inner payload, rewrite outer L2, and redirect toward N6.
+ */
 SEC("xdp/mini_upf")
 int mini_upf(struct xdp_md *ctx)
 {
@@ -102,6 +122,7 @@ int mini_upf(struct xdp_md *ctx)
 	if ((void *)(eth + 1) > data_end)
 		return XDP_PASS;
 
+	/* Enforce the configured N3 interface; otherwise pass the packet. */
 	if (!check_ingress_if(ingress_ifindex))
 		return XDP_PASS;
 
@@ -117,6 +138,7 @@ int mini_upf(struct xdp_md *ctx)
 		struct iphdr *iph = cursor;
 		if ((void *)(iph + 1) > data_end)
 			return XDP_PASS;
+		/* Only decap UDP/GTP-U; drop fragments to keep parsing simple. */
 		if (iph->protocol != IPPROTO_UDP)
 			return XDP_PASS;
 		if (iph->ihl < 5)
@@ -130,7 +152,7 @@ int mini_upf(struct xdp_md *ctx)
 			return XDP_PASS;
 		if (ip6->nexthdr != IPPROTO_UDP)
 			return XDP_PASS;
-		/* 拡張ヘッダは未対応 */
+		/* IPv6 extension headers are not handled */
 		cursor = ip6 + 1;
 		is_ipv6 = true;
 	} else {
@@ -146,6 +168,7 @@ int mini_upf(struct xdp_md *ctx)
 	gtp = (void *)(udp + 1);
 	if ((void *)(gtp + 1) > data_end)
 		return XDP_PASS;
+	/* Require GTP-U TPDU; anything else is passed unchanged. */
 	if (gtp->flags != GTPU_FLAGS || gtp->msg_type != GTPU_MSGTYPE_TPDU)
 		return XDP_PASS;
 
@@ -157,6 +180,7 @@ int mini_upf(struct xdp_md *ctx)
 
 	struct teid_fwd *fwd = bpf_map_lookup_elem(&teid_fwd, &teid);
 	if (!fwd) {
+		/* No TEID entry means drop in this uplink-only path. */
 		update_stats_miss(teid);
 		return XDP_DROP;
 	}
@@ -168,6 +192,7 @@ int mini_upf(struct xdp_md *ctx)
 	if (adjust < 0)
 		return XDP_ABORTED;
 
+	/* Trim outer Ethernet/IP/UDP/GTP-U so the inner packet becomes the new head. */
 	if (bpf_xdp_adjust_head(ctx, adjust))
 		return XDP_ABORTED;
 
@@ -178,6 +203,7 @@ int mini_upf(struct xdp_md *ctx)
 	if ((void *)(eth + 1) > data_end)
 		return XDP_ABORTED;
 
+	/* Set outer L2 for N6 egress. */
 	__builtin_memcpy(eth->h_dest, fwd->dst_mac, ETH_ALEN);
 	__builtin_memcpy(eth->h_source, fwd->src_mac, ETH_ALEN);
 	eth->h_proto = bpf_htons(is_ipv6 ? ETH_P_IPV6 : ETH_P_IP);
@@ -185,6 +211,7 @@ int mini_upf(struct xdp_md *ctx)
 	if (!fwd->out_ifindex)
 		return XDP_ABORTED;
 
+	/* Redirect toward N6 using the configured egress ifindex. */
 	return bpf_redirect(fwd->out_ifindex, 0);
 }
 

@@ -13,7 +13,7 @@ Minimal UPF-style data plane using XDP: GTP-U decap on N3, TEID lookup, counters
 
 ## Build
 ```bash
-clang -O2 -g -target bpf -c xdp/mini_upf.c -o xdp/mini_upf.o
+make
 ```
 
 ## Attach (example)
@@ -40,9 +40,3 @@ bpftool map update pinned /sys/fs/bpf/tc/globals/teid_fwd key 01 00 00 00 \
 ## Stats
 - Dump counters: `bpftool map dump pinned /sys/fs/bpf/tc/globals/teid_stats`
 - `lookup_miss` increments on TEID miss.
-
-## Cleanup
-```bash
-bpftool net detach xdp dev $N3
-rm -f /sys/fs/bpf/mini_upf
-```
