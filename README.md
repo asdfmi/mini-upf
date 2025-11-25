@@ -13,6 +13,7 @@ Minimal UPF-style data plane using XDP: GTP-U decap on N3, TEID lookup, counters
 
 ## Build
 ```bash
+# Build XDP object + test sender
 make
 ```
 
@@ -36,6 +37,16 @@ bpftool map update pinned /sys/fs/bpf/tc/globals/teid_fwd key 01 00 00 00 \
 ```
 
 > Note: Update the `teid_fwd` value bytes to include proper `dst_mac`/`src_mac` (12 bytes) and optional next-hop. The above is illustrative only; prefer `bpftool map -f` with a hex blob.
+
+## Send a test GTP-U packet (raw socket helper)
+- `send_gtpu` crafts one GTP-U TPDU (TEID=1, Flags=0x30, MsgType=TPDU, payload=4 bytes) and sends it on a given interface using AF_PACKET.
+- Example (assuming `teid_fwd` has TEID=1 pointing to `veth-n6`):
+```bash
+sudo ./send_gtpu veth-n3 $(cat /sys/class/net/veth-n6/address)
+```
+- Outer IP: 203.0.113.1 -> 203.0.113.2, UDP 12345 -> 2152
+- Inner IP: 10.0.0.1 -> 8.8.8.8, UDP 5555 -> 6666, payload: 01 02 03 04
+- Verify delivery: `tcpdump -i veth-n6 -n -e` or `bpftool map dump pinned /sys/fs/bpf/tc/globals/teid_stats`
 
 ## Stats
 - Dump counters: `bpftool map dump pinned /sys/fs/bpf/tc/globals/teid_stats`
