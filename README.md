@@ -1,6 +1,6 @@
-# mini-upf (XDP/eBPF PoC)
+# xdp-gtpu (XDP/eBPF uplink PoC)
 
-Minimal UPF-style data plane using XDP: GTP-U decap on N3, TEID lookup, counters, and redirect to N6. Control plane is omitted; maps are managed with `bpftool`.
+Minimal GTP-U uplink data plane using XDP: decap on N3, TEID lookup, counters, and redirect to N6. This is a UPF subset only; no control plane, PFCP, or downlink. Maps are managed with `bpftool`.
 
 ## Design snapshot
 - Scope: Uplink only (N3 -> N6), GTP-U Flags=0x30 T-PDU, drop on TEID miss.
